@@ -1,88 +1,106 @@
 import os
-import xarray as xr
-import spark
-from pyspark.sql import Row
-from pyspark.sql.types import StructType, StructField, StringType, FloatType
-from pyspark.sql.functions import col
-
+from torch.utils.data import Dataset
+from PIL import Image
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+from torchvision import transforms
 from pyspark.sql import SparkSession
 
-# 创建 SparkSession
-spark = SparkSession.builder \
-    .appName("NetCDF Processing") \
-    .getOrCreate()
 
-# 定义正确的数据文件路径
-folder_path = r'C:\Big_data\Data'
+spark = SparkSession.builder.appName("DistributedUNet").getOrCreate()
 
-# 获取所有子文件夹中的 .nc 文件
-files = []
-for root, dirs, file_names in os.walk(folder_path):
-    for file in file_names:
-        if file.endswith('.nc'):
-            files.append(os.path.join(root, file))
 
-# 按创建时间排序文件
-files_sorted = sorted(files, key=lambda x: os.path.getctime(x))
+class UNet(nn.Module):
+    def __init__(self):
+        super(UNet, self).__init__()
+        def CBR(in_channels, out_channels):
+            return nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True)
+            )
+        
+        self.enc1 = CBR(3, 64)
+        self.enc2 = CBR(64, 128)
+        self.enc3 = CBR(128, 256)
+        self.enc4 = CBR(256, 512)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.center = CBR(512, 1024)
+        self.up4 = nn.ConvTranspose2d(1024, 512, kernel_size=2, stride=2)
+        self.dec4 = CBR(1024, 512)
+        self.up3 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
+        self.dec3 = CBR(512, 256)
+        self.up2 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
+        self.dec2 = CBR(256, 128)
+        self.up1 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.dec1 = CBR(128, 64)
+        self.final = nn.Conv2d(64, 25, kernel_size=1)  # 25个类别
 
-# 定义 Spark DataFrame 的 schema
-schema = StructType([
-    StructField("time", StringType(), True),
-    StructField("SST", FloatType(), True),
-    StructField("DQF", FloatType(), True)
-])
+    def forward(self, x):
+        enc1 = self.enc1(x)
+        enc2 = self.enc2(self.pool(enc1))
+        enc3 = self.enc3(self.pool(enc2))
+        enc4 = self.enc4(self.pool(enc3))
+        center = self.center(self.pool(enc4))
+        dec4 = self.dec4(torch.cat([self.up4(center), enc4], dim=1))
+        dec3 = self.dec3(torch.cat([self.up3(dec4), enc3], dim=1))
+        dec2 = self.dec2(torch.cat([self.up2(dec3), enc2], dim=1))
+        dec1 = self.dec1(torch.cat([self.up1(dec2), enc1], dim=1))
+        final = self.final(dec1)
+        return final
 
-# 定义一个空的 RDD 来存储所有数据
-all_data_rdd = spark.sparkContext.emptyRDD()
 
-# 依次处理每个文件
-for file in files_sorted:
-    print(f"正在处理文件: {os.path.basename(file)}")
+def process_data(image_mask_pair):
+    image_path, mask_path = image_mask_pair
+    image = Image.open(image_path).convert("RGB")
+    mask = Image.open(mask_path).convert("L")  # 灰度掩码
+    transform = transforms.Compose([transforms.Resize((256, 256)), transforms.ToTensor()])
+    image = transform(image)
+    mask = transform(mask)
+    return image, mask
 
-    # 打开 NetCDF 文件
-    ds = xr.open_dataset(file)
 
-    # 提取相关特征
-    time_bounds = ds['time_bounds'].values if 'time_bounds' in ds.variables else None
-    sst = ds['SST'].values if 'SST' in ds.variables else None
-    dqf = ds['DQF'].values if 'DQF' in ds.variables else None
+def load_data_rdd(images_dir, masks_dir):
+    images_list = os.listdir(images_dir)
+    masks_list = [image.replace(".jpg", ".png") for image in images_list]
+    image_mask_paths = [(os.path.join(images_dir, img), os.path.join(masks_dir, mask)) for img, mask in zip(images_list, masks_list)]
+    data_rdd = spark.sparkContext.parallelize(image_mask_paths, numSlices=2)
+    return data_rdd
 
-    # 检查 SST 和 DQF 的长度是否相等
-    if sst is not None and dqf is not None and sst.size == dqf.size:
-        # 提取 time_bounds 的第一个元素作为时间标记
-        if time_bounds is not None and time_bounds.ndim > 0:
-            time_bound_name = str(time_bounds[0])  # 提取第一个时间值并将其转换为字符串
-        else:
-            time_bound_name = "unknown_time"
 
-        # 将 SST 和 DQF 转换为一维数组
-        sst_flattened = sst.flatten()
-        dqf_flattened = dqf.flatten()
+def train_on_partition(iterator):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = UNet().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    criterion = nn.CrossEntropyLoss()
 
-        # 将当前文件的数据转换为 RDD
-        file_rdd = spark.sparkContext.parallelize([
-            Row(time=time_bound_name, SST=float(sst_val), DQF=float(dqf_val))
-            for sst_val, dqf_val in zip(sst_flattened, dqf_flattened)
-        ])
+    for _ in range(5):  
+        running_loss = 0.0
+        for data in iterator:
+            image, mask = process_data(data)
+            image, mask = image.to(device), mask.to(device).long().squeeze(0)
 
-        # 将当前文件的 RDD 合并到总的 RDD 中
-        all_data_rdd = all_data_rdd.union(file_rdd)
+            optimizer.zero_grad()
+            outputs = model(image.unsqueeze(0)) 
+            loss = criterion(outputs, mask.unsqueeze(0))
+            loss.backward()
+            optimizer.step()
 
-    # 关闭 NetCDF 文件以释放资源
-    ds.close()
+            running_loss += loss.item()
+        yield running_loss
 
-# 将 RDD 转换为 Spark DataFrame
-all_data_df = spark.createDataFrame(all_data_rdd, schema)
 
-# 将时间列转换为日期时间格式
-all_data_df = all_data_df.withColumn("time", col("time").cast("timestamp"))
+train_images_dir = "C:/Users/yuhon/Big_data/Final_project/Data/harvey_damage_satelite/train_images"
+train_masks_dir = "C:/Users/yuhon/Big_data/Final_project/Data/harvey_damage_satelite/train_masks"
+train_data_rdd = load_data_rdd(train_images_dir, train_masks_dir)
 
-# 按时间列排序
-all_data_df = all_data_df.orderBy(col("time"))
 
-# 显示前几行结果
-all_data_df.show()
-
-# 保存最终处理后的数据到 Parquet 文件
-all_data_df.coalesce(1).write.mode("overwrite").parquet("output/sst_data.parquet")
+losses = train_data_rdd.mapPartitions(train_on_partition).collect()
+print(f"Total training loss across partitions: {sum(losses)}")
 
